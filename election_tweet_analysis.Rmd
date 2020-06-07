@@ -1,0 +1,318 @@
+---
+title: " Text Analysis of Tweets that Went Viral in the 2016 Election"
+author: "Regina Catipon"
+date: "6/2/2020"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(tidytext)
+library(topicmodels)
+library(here)
+library(rjson)
+library(tm)
+library(tictoc)
+library(readxl)
+library(ggplot2)
+library(textdata)
+library(future)
+library(furrr)
+
+data("stop_words")
+```
+
+
+```{r load-data}
+
+# load data
+electiontweetsDF <- read_excel(here("data", "electionday_tweets.xlsx"))
+
+glimpse(electiontweetsDF)
+
+# split datat into two parts
+fake_news <- electiontweetsDF %>%
+  filter(is_fake_news == TRUE)
+
+not_fake_news <- electiontweetsDF %>%
+  filter(is_fake_news == FALSE)
+
+glimpse(fake_news)
+```
+
+```{r tokens}
+# create list of other stop words unique to dataset
+other_stop_words <- list(word = c("http", "t.co", "https")) %>%
+  as_tibble()
+
+# tokenize
+tweet_tokens <- electiontweetsDF %>%
+  unnest_tokens(output = word, input = text) %>%
+  # remove numbers
+  filter(!str_detect(word, "^[0-9]*$")) %>%
+  # remove stop words
+  anti_join(stop_words) %>%
+  anti_join(other_stop_words)
+```
+
+
+```{r sentiment}
+
+# count sentiment
+sentiment_count <- tweet_tokens %>%
+  # call nrc dictionary
+  inner_join(get_sentiments("nrc")) %>%
+  filter(!is.na(sentiment)) %>%
+  # count(sentiment, sort = TRUE) %>%
+  group_by(is_fake_news, sentiment) %>%
+  mutate(count = n()) %>%
+  group_by(is_fake_news, sentiment, count) %>%
+  summarise()
+
+
+# rename facet grid labels
+tweet_type_names <- c(
+  "FALSE" = "Not Fake News",
+  "TRUE" = "Fake News"
+)
+
+# find percentages and plot
+sentiment_count %>%
+  group_by(is_fake_news) %>%
+  mutate(countT = sum(count)) %>%
+  group_by(sentiment) %>%
+  mutate(per = (round(count / countT, 2))) %>%
+  ggplot(aes(x = sentiment, y = per, fill = sentiment)) +
+  geom_col() +
+  facet_wrap(~is_fake_news, ncol = 1, labeller = as_labeller(tweet_type_names)) +
+  labs(
+    title = "Aggregate Sentiment & Emotion by Tweet Type",
+    x = "Sentiment",
+    y = "Percent"
+  ) +
+  scale_y_continuous(labels = scales::percent)
+
+```
+
+
+
+```{r}
+
+# count the sentiment in each tweet
+# find the percentage of sentiment in the tweet by calculating total
+# 
+
+# count sentiment
+tweet_tokens %>%
+  # call nrc dictionary
+  inner_join(get_sentiments("nrc")) %>%
+  filter(!is.na(sentiment)) %>%
+  # count(sentiment, sort = TRUE) %>%
+  group_by(is_fake_news, sentiment) %>%
+  mutate(count = n()) %>%
+  group_by(is_fake_news, sentiment, count) %>%
+  summarise() %>% 
+  mutate(counttr = ifelse(is_fake_news == TRUE, count/136, count/1191)
+         ) %>% 
+  ggplot(aes(x = sentiment, y = round(counttr,2), fill = sentiment)) +
+  geom_col() +
+  facet_wrap(~is_fake_news, ncol = 1, labeller = as_labeller(tweet_type_names)) +
+  labs(
+    title = "Aggregate Sentiment & Emotion by Tweet Type",
+    x = "Sentiment",
+    y = "Percent"
+  ) +
+  scale_y_continuous(labels = scales::percent, limits=c(0,.9))
+
+```
+
+## Unsupervised Topic Modeling
+
+### Extension: Comparing Fake News Topics
+
+
+```{r}
+# remove terms with low tf-idf for future LDA model
+tokens_lite <- tweet_tokens %>%
+  count(tweet_id, word) %>%
+  bind_tf_idf(term = word, document = tweet_id, n = n) %>%
+  group_by(tweet_id) %>%
+  top_n(40, wt = tf_idf) %>%
+  ungroup() %>%
+  count(word) %>%
+  select(-n) %>%
+  left_join(tweet_tokens)
+```
+
+```{r dtm-all}
+
+# create document term matrix
+tweet_dtm <- tokens_lite %>%
+  # get count of each token in each document
+  count(tweet_id, word) %>%
+  # create a document-term matrix with all features and tf weighting
+  cast_dtm(document = tweet_id, term = word, value = n)
+```
+
+```{r n-topics, include = FALSE}
+
+
+
+n_topics <- c(2, 4, 6, 7, 8, 10, 12, 14, 16, 18, 20)
+
+# cache the models and only estimate if they don't already exist
+
+tweets_lda_compare <- n_topics %>%
+  future_map(LDA, x = tweet_dtm, control = list(seed = 1234))
+
+```
+
+```{r plot-perplexity}
+
+# plot perplexity score
+tibble(
+  k = n_topics,
+  perplex = map_dbl(tweets_lda_compare, perplexity)
+) %>%
+  ggplot(aes(k, perplex)) +
+  geom_point() +
+  geom_line() +
+  labs(
+    title = "Evaluating LDA topic models",
+    subtitle = "Optimal number of topics (smaller is better)",
+    x = "Number of topics",
+    y = "Perplexity"
+  )
+```
+
+
+```{r tweet-topics, fig.height=9,  fig.width=11}
+
+# take not misinformation subset
+tweet_tokens <- not_fake_news %>%
+  unnest_tokens(output = word, input = text) %>%
+  # remove numbers
+  filter(!str_detect(word, "^[0-9]*$")) %>%
+  # remove stop words
+  anti_join(stop_words) %>%
+  anti_join(other_stop_words)
+
+
+# create document term matrix
+real_dtm <- tweet_tokens %>%
+  # get count of each token in each document
+  count(tweet_id, word) %>%
+  # create a document-term matrix with all features and tf weighting
+  cast_dtm(document = tweet_id, term = word, value = n)
+
+(real_dtm)
+```
+
+```{r topic-model-other, fig.height=9,  fig.width=11}
+# generate topic model, with 20 topics
+tweet_lda4 <- LDA(real_dtm, k = 7, control = list(seed = 123))
+tweet_lda4
+
+# make tidy
+tidy_tweet_lda <- tidy(tweet_lda4)
+
+# calculate the top 5 terms per tpic
+top_terms <- tidy_tweet_lda %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+
+# visualize with bar graph
+top_terms %>%
+  mutate(
+    topic = factor(topic),
+    term = reorder_within(term, beta, topic)
+  ) %>%
+  ggplot(aes(term, beta, fill = topic)) +
+  geom_bar(alpha = 0.8, stat = "identity", show.legend = FALSE) +
+  scale_x_reordered() +
+  facet_wrap(~topic, scales = "free", ncol = 3) +
+  coord_flip() +
+  labs(
+    title = "Not Fake News: Topics by Top 10 Terms",
+    x = "Probability of Term from Topic",
+    y = "Term"
+  )
+```
+
+
+### Topic Model: Fake News
+
+```{r fake-dtm}
+
+# tokenize
+fake_tokens <- fake_news %>%
+  unnest_tokens(output = word, input = text) %>%
+  # remove numbers
+  filter(!str_detect(word, "^[0-9]*$")) %>%
+  # remove stop words
+  anti_join(stop_words) %>%
+  anti_join(other_stop_words)
+
+# create document term matrix
+fake_dtm <- fake_tokens %>%
+  # get count of each token in each document
+  count(tweet_id, word) %>%
+  # create a document-term matrix with all features and tf weighting
+  cast_dtm(document = tweet_id, term = word, value = n)
+
+(fake_dtm)
+```
+
+Then the topic model was generated and the top 10 terms per topic were plotted.
+
+```{r fake-topic-model, fig.height=9,  fig.width=11}
+# generate topic model, with 7 topics
+fake_lda <- LDA(fake_dtm, k = 7, control = list(seed = 2424))
+fake_lda
+
+# make tidy
+tidy_fake_lda <- tidy(fake_lda)
+
+# calculate the top 5 terms per tpic
+top_fake_terms <- tidy_fake_lda %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+# visualize with bar graph
+top_fake_terms %>%
+  mutate(
+    topic = factor(topic),
+    term = reorder_within(term, beta, topic)
+  ) %>%
+  ggplot(aes(term, beta, fill = topic)) +
+  geom_bar(alpha = 0.8, stat = "identity", show.legend = FALSE) +
+  scale_x_reordered() +
+  facet_wrap(~topic, scales = "free", ncol = 3) +
+  coord_flip() +
+  labs(
+    title = "Fake News: Topics by Top 10 Terms",
+    x = "Probability of Term from Topic",
+    y = "Term"
+  )
+```
+
+
+```{r topic-5, include = FALSE}
+
+# inspect topic 5
+top_fake_terms %>%
+  filter(topic == 5) %>%
+  top_n(7)
+```
+
